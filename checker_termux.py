@@ -4,8 +4,14 @@
 Chekdido 2026 — CLI Edition
 Прокси-чекер для Termux и серверов без GUI.
 
-pip install aiohttp aiohttp-socks
-python checker_cli.py
+Установка в Termux:
+    pkg update && pkg upgrade -y
+    pkg install python -y
+    pip install aiohttp aiohttp-socks
+    python checker_cli.py
+
+ВАЖНО: все результаты сохраняются РЯДОМ со скриптом,
+в подпапку "Chekdido_Downloads" в формате .txt
 """
 
 import os
@@ -32,14 +38,16 @@ except ImportError:
 CHECK_URL = "https://api.ipify.org?format=json"
 FALLBACK_URL = "http://httpbin.org/ip"
 CHECK_TIMEOUT = 10
-MAX_CONCURRENT = 500
+MAX_CONCURRENT = 200
 RETRIES = 2
 
 SMART_TARGET_ALIVE = 500
 SMART_BATCH_SIZE = 2000
 SMART_MAX_ROUNDS = 6
 
-AUTO_SAVE_DIR = os.path.join(os.path.expanduser("~"), "Chekdido_Downloads")
+# ===== ПАПКА АВТОСЕЙВА — РЯДОМ СО СКРИПТОМ =====
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTO_SAVE_DIR = os.path.join(SCRIPT_DIR, "Chekdido_Downloads")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -96,7 +104,8 @@ def banner():
   ║   ◤ Chekdido — PROXY CHECKER · 2026 EDITION (CLI)         ║
   ╚═══════════════════════════════════════════════════════════╝{C.R}
   {C.GRAY}Автоскачивание · Автопроверка · Автосохранение в .txt{C.R}
-  {C.GRAY}Папка автосейва: {AUTO_SAVE_DIR}{C.R}
+  {C.GRN}📁 Папка автосейва (рядом со скриптом):{C.R}
+  {C.CYA}   {AUTO_SAVE_DIR}{C.R}
 """)
 
 
@@ -160,11 +169,12 @@ _auto_lock = threading.Lock()
 def ensure_dir():
     try:
         os.makedirs(AUTO_SAVE_DIR, exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  {C.RED}⚠ Не могу создать папку {AUTO_SAVE_DIR}: {e}{C.R}")
 
 
 def auto_save_single(p: ProxyItem) -> bool:
+    """Сохраняет один живой прокси в отдельный .txt рядом со скриптом."""
     ensure_dir()
     path = os.path.join(AUTO_SAVE_DIR, f"{p.filename}.txt")
     try:
@@ -176,9 +186,23 @@ def auto_save_single(p: ProxyItem) -> bool:
         return False
 
 
-# ======================= ПРОГРЕСС-БАР В КОНСОЛИ =======================
+def auto_save_raw_batch(items: List[ProxyItem], prefix: str) -> str:
+    """Сохраняет СВЕЖЕСКАЧАННЫЕ прокси в один .txt рядом со скриптом."""
+    ensure_dir()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(AUTO_SAVE_DIR, f"{prefix}_{ts}.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for p in items:
+                f.write(f"{p.ptype}://{p.addr}\n")
+        return path
+    except Exception as e:
+        print(f"  {C.RED}Ошибка сохранения {path}: {e}{C.R}")
+        return ""
+
+
+# ======================= ПРОГРЕСС-БАР =======================
 class ProgressBar:
-    """Живой прогресс-бар в одной строке консоли."""
     def __init__(self, total: int, label: str = "", width: int = 30):
         self.total = max(total, 1)
         self.done = 0
@@ -222,7 +246,6 @@ class ProgressBar:
         speed = done / elapsed
         eta = (self.total - done) / speed if speed > 0 else 0
 
-        # цвет по проценту
         if percent < 0.33:
             color = C.RED
         elif percent < 0.66:
@@ -239,11 +262,10 @@ class ProgressBar:
             f"{C.CYA}⚡{speed:5.1f}/с{C.R}  "
             f"{C.YEL}⏱ {self._fmt_eta(eta)}{C.R}"
         )
-        # обрезаем до ширины терминала
         try:
             term_w = os.get_terminal_size().columns
         except Exception:
-            term_w = 120
+            term_w = 100
         sys.stdout.write(line[:term_w].ljust(term_w - 1))
         sys.stdout.flush()
 
@@ -299,10 +321,9 @@ async def download_all(selected_type: str, exclude_keys: Set[str],
             pb.render()
     pb.finish()
 
-    # объединяем + дедуп + автосейв
+    # объединяем + дедуп
     seen: Set[str] = set()
     merged: List[ProxyItem] = []
-    saved = 0
     for items in results:
         for it in items:
             key = f"{it.ptype}://{it.host}:{it.port}"
@@ -310,11 +331,14 @@ async def download_all(selected_type: str, exclude_keys: Set[str],
                 continue
             seen.add(key)
             merged.append(it)
-            if auto_save_single(it):
-                saved += 1
+
+    # сохраняем ВСЕ скачанные одним файлом рядом со скриптом
+    prefix = f"raw_{selected_type}" if selected_type != "all" else "raw_all"
+    saved_path = auto_save_raw_batch(merged, prefix)
 
     print(f"  {C.GRN}✅ Уникальных прокси: {len(merged)}{C.R}")
-    print(f"  {C.CYA}💾 Сохранено в .txt: {saved} → {AUTO_SAVE_DIR}{C.R}")
+    if saved_path:
+        print(f"  {C.CYA}💾 Сохранено в .txt:{C.R} {saved_path}")
     return merged
 
 
@@ -393,7 +417,6 @@ def smart_mode(selected_type: str, target_alive: int):
     print(f"  {C.GRAY}Тип: {selected_type} · Цель: {target_alive} живых · "
           f"Порция: {SMART_BATCH_SIZE} · Раундов: {SMART_MAX_ROUNDS}{C.R}\n")
 
-    all_checked: List[ProxyItem] = []
     alive_total: List[ProxyItem] = []
     used_keys: Set[str] = set()
     stop_event = threading.Event()
@@ -416,7 +439,6 @@ def smart_mode(selected_type: str, target_alive: int):
             asyncio.run(check_batch(batch, pb, stop_event))
             pb.finish()
 
-            all_checked.extend(batch)
             round_alive = [p for p in batch if p.alive]
             alive_total.extend(round_alive)
 
@@ -437,6 +459,9 @@ def smart_mode(selected_type: str, target_alive: int):
         avg = sum(p.ping for p in final) / len(final)
         print(f"\n  {C.GRN}🏁 Итог: {len(final)} лучших живых · "
               f"Средний ping: {avg:.0f} мс{C.R}")
+        save_list(final, os.path.join(AUTO_SAVE_DIR, "_smart_alive.txt"))
+        save_list(final[:500], os.path.join(AUTO_SAVE_DIR, "_smart_top500.txt"))
+        save_json(final, os.path.join(AUTO_SAVE_DIR, "_smart_alive.json"))
     else:
         print(f"\n  {C.RED}Живых прокси не найдено.{C.R}")
     return final
@@ -444,10 +469,13 @@ def smart_mode(selected_type: str, target_alive: int):
 
 # ======================= СОХРАНЕНИЕ СВОДНЫХ =======================
 def save_list(items: List[ProxyItem], path: str):
-    with open(path, "w", encoding="utf-8") as f:
-        for p in items:
-            f.write(f"{p.ptype}://{p.addr}\n")
-    print(f"  {C.CYA}💾 Сохранено {len(items)} → {path}{C.R}")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for p in items:
+                f.write(f"{p.ptype}://{p.addr}\n")
+        print(f"  {C.CYA}💾 Сохранено {len(items)} → {path}{C.R}")
+    except Exception as e:
+        print(f"  {C.RED}Ошибка сохранения {path}: {e}{C.R}")
 
 
 def save_json(items: List[ProxyItem], path: str):
@@ -462,9 +490,12 @@ def save_json(items: List[ProxyItem], path: str):
             "checked_at": datetime.utcnow().isoformat() + "Z",
         } for p in items],
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"  {C.CYA}📦 JSON сохранён: {path}{C.R}")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"  {C.CYA}📦 JSON сохранён: {path}{C.R}")
+    except Exception as e:
+        print(f"  {C.RED}Ошибка JSON: {e}{C.R}")
 
 
 # ======================= МЕНЮ =======================
@@ -506,11 +537,15 @@ def main_menu():
         print(f"    {C.MAG}1{C.R}) 🧠  Умный режим (скачать → чекать → цель живых)")
         print(f"    {C.CYA}2{C.R}) ⬇  Скачать прокси 2026 (сохраняет каждый в .txt)")
         print(f"    {C.GRN}3{C.R}) ⚡  Проверить скачанные прокси")
-        print(f"    {C.YEL}4{C.R}) 📁  Открыть папку автосейва")
+        print(f"    {C.YEL}4{C.R}) 📁  Показать путь к папке автосейва")
         print(f"    {C.GRAY}5{C.R}) 🧹  Очистить папку автосейва")
         print(f"    {C.RED}0{C.R}) 🚪  Выход\n")
 
-        choice = input(f"  {C.B}Выбор:{C.R} ").strip()
+        try:
+            choice = input(f"  {C.B}Выбор:{C.R} ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n\n  {C.CYA}Пока! 👋{C.R}\n")
+            return
 
         if choice == "1":
             selected = ask_type()
@@ -525,11 +560,17 @@ def main_menu():
             input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
         elif choice == "3":
-            # проверяем то, что уже лежит в папке автосейва
             ensure_dir()
-            files = [f for f in os.listdir(AUTO_SAVE_DIR) if f.endswith(".txt")]
+            try:
+                files = [f for f in os.listdir(AUTO_SAVE_DIR)
+                         if f.endswith(".txt") and not f.startswith("_")
+                         and not f.startswith("raw_")]
+            except Exception:
+                files = []
+
             if not files:
                 print(f"\n  {C.YEL}⚠ Папка автосейва пуста. Сначала скачайте прокси.{C.R}")
+                print(f"  {C.GRAY}Папка: {AUTO_SAVE_DIR}{C.R}")
                 input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
                 continue
 
@@ -567,7 +608,6 @@ def main_menu():
             alive.sort(key=lambda x: x.ping)
             print(f"\n  {C.GRN}✅ Живых: {len(alive)} из {len(items)}{C.R}")
             if alive:
-                # авто-сохраняем сводки
                 save_list(alive, os.path.join(AUTO_SAVE_DIR, "_alive_all.txt"))
                 save_list(alive[:500], os.path.join(AUTO_SAVE_DIR, "_alive_top500.txt"))
                 for t in ("http", "socks4", "socks5"):
@@ -586,40 +626,63 @@ def main_menu():
 
         elif choice == "4":
             ensure_dir()
-            print(f"\n  {C.CYA}Папка: {AUTO_SAVE_DIR}{C.R}")
+            print(f"\n  {C.GRN}📁 Папка автосейва:{C.R}")
+            print(f"  {C.CYA}{AUTO_SAVE_DIR}{C.R}\n")
+            files = []
             try:
-                if os.name == "nt":
-                    os.startfile(AUTO_SAVE_DIR)  # type: ignore
-                else:
-                    os.system(f"termux-open {AUTO_SAVE_DIR} 2>/dev/null || "
-                              f"xdg-open {AUTO_SAVE_DIR} 2>/dev/null &")
-                print(f"  {C.GRN}Открываю...{C.R}")
-            except Exception as e:
-                print(f"  {C.YEL}Не удалось открыть: {e}{C.R}")
+                files = [f for f in os.listdir(AUTO_SAVE_DIR)
+                         if f.endswith(".txt")]
+            except Exception:
+                pass
+            print(f"  {C.WHT}Файлов .txt: {len(files)}{C.R}")
+
+            # В Termux можно открыть через файловый менеджер вручную
+            if files:
+                print(f"\n  {C.B}Последние 10 файлов:{C.R}")
+                for f in sorted(files)[-10:]:
+                    print(f"    {C.GRAY}•{C.R} {f}")
+
+            print(f"\n  {C.YEL}Как открыть в Android:{C.R}")
+            print(f"  {C.GRAY}Откройте проводник и перейдите в:{C.R}")
+            print(f"  {C.CYA}{AUTO_SAVE_DIR}{C.R}")
+            print(f"  {C.GRAY}(начните путь с /data/data/com.termux/...){C.R}")
+
             input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
         elif choice == "5":
             ensure_dir()
-            confirm = input(f"  {C.RED}Удалить все .txt в {AUTO_SAVE_DIR}? (y/N):{C.R} ").strip().lower()
+            confirm = input(
+                f"  {C.RED}Удалить все .txt и .json в {AUTO_SAVE_DIR}? (y/N):{C.R} "
+            ).strip().lower()
             if confirm == "y":
                 cnt = 0
-                for f in os.listdir(AUTO_SAVE_DIR):
-                    if f.endswith(".txt") or f.endswith(".json"):
-                        try:
-                            os.remove(os.path.join(AUTO_SAVE_DIR, f))
-                            cnt += 1
-                        except Exception:
-                            pass
+                try:
+                    for f in os.listdir(AUTO_SAVE_DIR):
+                        if f.endswith(".txt") or f.endswith(".json"):
+                            try:
+                                os.remove(os.path.join(AUTO_SAVE_DIR, f))
+                                cnt += 1
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 print(f"  {C.GRN}Удалено файлов: {cnt}{C.R}")
             input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
         elif choice == "0":
             print(f"\n  {C.CYA}До встречи! 👋{C.R}\n")
+            print(f"  {C.GRAY}Все файлы сохранены в:{C.R}")
+            print(f"  {C.CYA}{AUTO_SAVE_DIR}{C.R}\n")
             return
 
 
 # ======================= СТАРТ =======================
 if __name__ == "__main__":
+    # Создаём папку автосейва сразу при запуске
+    ensure_dir()
+    print(f"{C.GRN}📁 Папка автосейва: {AUTO_SAVE_DIR}{C.R}")
+    time.sleep(0.5)
+
     try:
         main_menu()
     except KeyboardInterrupt:
