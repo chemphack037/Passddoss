@@ -10,8 +10,11 @@ Chekdido 2026 — CLI Edition
     pip install aiohttp aiohttp-socks
     python checker_cli.py
 
-ВАЖНО: все результаты сохраняются РЯДОМ со скриптом,
-в подпапку "Chekdido_Downloads" в формате .txt
+Все результаты сохраняются РЯДОМ со скриптом:
+    socks5.txt   — все живые SOCKS5 (построчно)
+    socks4.txt   — все живые SOCKS4
+    http.txt     — все живые HTTP
+    raw_*.txt    — свежескачанные одним файлом
 """
 
 import os
@@ -47,7 +50,6 @@ SMART_MAX_ROUNDS = 6
 
 # ===== ПАПКА АВТОСЕЙВА — РЯДОМ СО СКРИПТОМ =====
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-AUTO_SAVE_DIR = os.path.join(SCRIPT_DIR, "Chekdido_Downloads")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -104,8 +106,8 @@ def banner():
   ║   ◤ Chekdido — PROXY CHECKER · 2026 EDITION (CLI)         ║
   ╚═══════════════════════════════════════════════════════════╝{C.R}
   {C.GRAY}Автоскачивание · Автопроверка · Автосохранение в .txt{C.R}
-  {C.GRN}📁 Папка автосейва (рядом со скриптом):{C.R}
-  {C.CYA}   {AUTO_SAVE_DIR}{C.R}
+  {C.GRN}📁 Папка со скриптом (сюда сохраняются .txt):{C.R}
+  {C.CYA}   {SCRIPT_DIR}{C.R}
 """)
 
 
@@ -121,15 +123,13 @@ class ProxyItem:
     anonymity: str = "-"
     exit_ip: str = "-"
     protocol: str = "-"
+    confirmed: bool = False
+    checks_passed: int = 0
+    checks_total: int = 0
 
     @property
     def addr(self) -> str:
         return f"{self.host}:{self.port}"
-
-    @property
-    def filename(self) -> str:
-        safe = f"{self.ptype}_{self.host}_{self.port}"
-        return re.sub(r"[^\w\.\-]", "_", safe)
 
 
 PROXY_LINE_RE = re.compile(
@@ -162,35 +162,61 @@ def parse_proxy_line(line: str, default_type: str = "http") -> Optional[ProxyIte
     return ProxyItem(host=host, port=port, ptype=scheme)
 
 
-# ======================= АВТОСОХРАНЕНИЕ =======================
-_auto_lock = threading.Lock()
+# ======================= СОХРАНЕНИЕ ПО ТИПАМ =======================
+_type_locks: Dict[str, threading.Lock] = {
+    "http": threading.Lock(),
+    "socks4": threading.Lock(),
+    "socks5": threading.Lock(),
+}
 
 
-def ensure_dir():
+def _type_file(ptype: str) -> str:
+    """Путь к общему файлу для данного типа, рядом со скриптом."""
+    return os.path.join(SCRIPT_DIR, f"{ptype}.txt")
+
+
+def append_alive(p: ProxyItem) -> bool:
+    """Дописывает живой прокси в общий файл его типа (http.txt / socks4.txt / socks5.txt)."""
+    path = _type_file(p.ptype)
+    lock = _type_locks.get(p.ptype) or threading.Lock()
     try:
-        os.makedirs(AUTO_SAVE_DIR, exist_ok=True)
-    except Exception as e:
-        print(f"  {C.RED}⚠ Не могу создать папку {AUTO_SAVE_DIR}: {e}{C.R}")
-
-
-def auto_save_single(p: ProxyItem) -> bool:
-    """Сохраняет один живой прокси в отдельный .txt рядом со скриптом."""
-    ensure_dir()
-    path = os.path.join(AUTO_SAVE_DIR, f"{p.filename}.txt")
-    try:
-        with _auto_lock:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(f"{p.ptype}://{p.addr}\n")
+        with lock:
+            # защита от дубликатов: читаем текущие строки
+            existing = set()
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            existing.add(line.strip())
+                except Exception:
+                    pass
+            entry = f"{p.ptype}://{p.addr}"
+            if entry in existing:
+                return True
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
         return True
     except Exception:
         return False
 
 
-def auto_save_raw_batch(items: List[ProxyItem], prefix: str) -> str:
-    """Сохраняет СВЕЖЕСКАЧАННЫЕ прокси в один .txt рядом со скриптом."""
-    ensure_dir()
+def append_raw_batch(items: List[ProxyItem], prefix: str) -> str:
+    """Сохраняет свежескачанные прокси одним файлом рядом со скриптом."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(AUTO_SAVE_DIR, f"{prefix}_{ts}.txt")
+    path = os.path.join(SCRIPT_DIR, f"{prefix}_{ts}.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for p in items:
+                f.write(f"{p.ptype}://{p.addr}\n")
+        return path
+    except Exception as e:
+        print(f"  {C.RED}Ошибка сохранения {path}: {e}{C.R}")
+        return ""
+
+
+def write_summary(items: List[ProxyItem], name: str) -> str:
+    """Пишет сводный файл (перезаписывает) рядом со скриптом."""
+    path = os.path.join(SCRIPT_DIR, name)
     try:
         with open(path, "w", encoding="utf-8") as f:
             for p in items:
@@ -321,7 +347,6 @@ async def download_all(selected_type: str, exclude_keys: Set[str],
             pb.render()
     pb.finish()
 
-    # объединяем + дедуп
     seen: Set[str] = set()
     merged: List[ProxyItem] = []
     for items in results:
@@ -332,9 +357,8 @@ async def download_all(selected_type: str, exclude_keys: Set[str],
             seen.add(key)
             merged.append(it)
 
-    # сохраняем ВСЕ скачанные одним файлом рядом со скриптом
     prefix = f"raw_{selected_type}" if selected_type != "all" else "raw_all"
-    saved_path = auto_save_raw_batch(merged, prefix)
+    saved_path = append_raw_batch(merged, prefix)
 
     print(f"  {C.GRN}✅ Уникальных прокси: {len(merged)}{C.R}")
     if saved_path:
@@ -398,7 +422,7 @@ async def check_one(item, sem, pb, save_alive_cb=None):
 
 async def check_batch(items, pb, stop_event):
     sem = asyncio.Semaphore(MAX_CONCURRENT)
-    tasks = [asyncio.create_task(check_one(it, sem, pb, auto_save_single))
+    tasks = [asyncio.create_task(check_one(it, sem, pb, append_alive))
              for it in items]
     while tasks:
         if stop_event.is_set():
@@ -409,6 +433,230 @@ async def check_batch(items, pb, stop_event):
         tasks = list(pending)
         pb.render()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ======================= БЫСТРЫЙ ЧЕК С ТОЧНОСТЬЮ =======================
+async def _quick_probe(item: ProxyItem) -> bool:
+    res = await _try_request(item)
+    return res is not None
+
+
+async def precision_check_one(item: ProxyItem, sem, pb,
+                              passes: int = 3,
+                              pause_between: float = 0.8):
+    async with sem:
+        ok_count = 0
+        total_ping = 0.0
+        for i in range(passes):
+            start = time.perf_counter()
+            ok = await _quick_probe(item)
+            if ok:
+                ok_count += 1
+                total_ping += (time.perf_counter() - start) * 1000
+            if i < passes - 1:
+                await asyncio.sleep(pause_between)
+
+        item.checks_passed = ok_count
+        item.checks_total = passes
+        if ok_count == passes:
+            item.alive = True
+            item.confirmed = True
+            item.ping = total_ping / ok_count
+            item.exit_ip = "-"
+            item.anonymity = "elite"
+            item.protocol = "HTTPS" if item.ptype == "http" else item.ptype.upper()
+            pb.tick(True)
+            append_alive(item)
+        else:
+            item.alive = False
+            item.confirmed = False
+            pb.tick(False)
+        item.checked = True
+
+
+async def precision_check_batch(items, pb, stop_event,
+                                passes: int = 3,
+                                pause_between: float = 0.8):
+    sem = asyncio.Semaphore(max(MAX_CONCURRENT // 2, 50))
+    tasks = [
+        asyncio.create_task(
+            precision_check_one(it, sem, pb, passes, pause_between)
+        ) for it in items
+    ]
+    while tasks:
+        if stop_event.is_set():
+            for t in tasks:
+                t.cancel()
+            break
+        _, pending = await asyncio.wait(tasks, timeout=0.25)
+        tasks = list(pending)
+        pb.render()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def collect_proxy_files() -> List[str]:
+    """Возвращает список .txt с одиночными прокси (без сводных и raw_*)."""
+    try:
+        files = []
+        for f in os.listdir(SCRIPT_DIR):
+            if not f.endswith(".txt"):
+                continue
+            if f.startswith("_") or f.startswith("raw_"):
+                continue
+            if f in ("http.txt", "socks4.txt", "socks5.txt",
+                     "alive.txt", "alive_top500.txt"):
+                continue
+            files.append(os.path.join(SCRIPT_DIR, f))
+        return files
+    except Exception:
+        return []
+
+
+def load_proxies_from_files(files: List[str], limit: int) -> List[ProxyItem]:
+    """Читает прокси из переданных .txt файлов (построчно)."""
+    items: List[ProxyItem] = []
+    seen: Set[str] = set()
+    for path in files:
+        if limit > 0 and len(items) >= limit:
+            break
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    it = parse_proxy_line(line)
+                    if not it:
+                        continue
+                    key = f"{it.ptype}://{it.host}:{it.port}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    items.append(it)
+                    if limit > 0 and len(items) >= limit:
+                        break
+        except Exception:
+            continue
+    return items
+
+
+def quick_precision_mode():
+    """Пункт меню: быстрый чек живых с точностью."""
+    # Собираем .txt с одиночными прокси
+    proxy_files = collect_proxy_files()
+
+    # Плюс общие файлы http.txt / socks4.txt / socks5.txt, если в них что-то есть
+    for f in ("http.txt", "socks4.txt", "socks5.txt"):
+        p = os.path.join(SCRIPT_DIR, f)
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            proxy_files.append(p)
+
+    if not proxy_files:
+        print(f"\n  {C.YEL}⚠ Нет .txt с прокси. Сначала скачайте прокси.{C.R}")
+        print(f"  {C.GRAY}Папка: {SCRIPT_DIR}{C.R}")
+        input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
+        return
+
+    print(f"\n  {C.MAG}{C.B}🎯 БЫСТРЫЙ ЧЕК ЖИВЫХ С ТОЧНОСТЬЮ{C.R}")
+    print(f"  {C.GRAY}Папка: {SCRIPT_DIR}{C.R}")
+    print(f"  {C.GRAY}Найдено {len(proxy_files)} .txt файлов с прокси.{C.R}\n")
+
+    limit = ask_int("Сколько проверить (0 = все)", 500)
+    if limit < 0:
+        limit = 0
+
+    passes = ask_int("Сколько проходов на каждый прокси (2-5)", 3)
+    if passes < 2:
+        passes = 2
+    if passes > 5:
+        passes = 5
+
+    pause_ms = ask_int("Пауза между проходами, мс (0-2000)", 800)
+    pause_s = max(0, min(pause_ms, 2000)) / 1000.0
+
+    items = load_proxies_from_files(proxy_files, limit)
+
+    if not items:
+        print(f"  {C.RED}Не удалось прочитать ни один прокси.{C.R}")
+        input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
+        return
+
+    print(f"\n  {C.CYA}⚡ Точная проверка {len(items)} прокси...{C.R}")
+    print(f"  {C.GRAY}Проходов: {passes} · Пауза: {pause_ms} мс · "
+          f"Потоков: {max(MAX_CONCURRENT // 2, 50)}{C.R}\n")
+
+    pb = ProgressBar(len(items), label="точный чек", width=30)
+    stop_event = threading.Event()
+    try:
+        asyncio.run(precision_check_batch(
+            items, pb, stop_event, passes=passes, pause_between=pause_s
+        ))
+    except KeyboardInterrupt:
+        stop_event.set()
+    pb.finish()
+
+    alive = [p for p in items if p.confirmed]
+    alive.sort(key=lambda x: x.ping)
+
+    total = len(items)
+    confirmed = len(alive)
+    accuracy = (confirmed / total * 100) if total else 0.0
+
+    partial = [p for p in items
+               if p.checked and not p.confirmed and p.checks_passed > 0]
+    partial_rate = (len(partial) / total * 100) if total else 0.0
+
+    print(f"\n  {C.B}{C.WHT}📊 РЕЗУЛЬТАТЫ ТОЧНОЙ ПРОВЕРКИ{C.R}")
+    print(f"  {C.GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.R}")
+    print(f"  Всего проверено:        {C.WHT}{total}{C.R}")
+    print(f"  {C.GRN}✅ 100% подтверждены:   {confirmed} "
+          f"({accuracy:.1f}%){C.R}")
+    print(f"  {C.YEL}⚠  Прошли частично:     {len(partial)} "
+          f"({partial_rate:.1f}%){C.R}")
+    print(f"  {C.RED}❌ Мёртвые:              "
+          f"{total - confirmed - len(partial)}{C.R}")
+    print(f"  {C.GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{C.R}")
+
+    if alive:
+        avg_ping = sum(p.ping for p in alive) / len(alive)
+        print(f"  Средний ping:           {C.CYA}{avg_ping:.0f} мс{C.R}")
+
+        # Сводный файл только с 100% подтверждёнными
+        write_summary(alive, "confirmed.txt")
+
+        # JSON с метаданными
+        payload = {
+            "source": "Chekdido 2026 CLI",
+            "mode": "precision",
+            "passes": passes,
+            "pause_ms": pause_ms,
+            "count": len(alive),
+            "proxies": [{
+                "type": p.ptype, "host": p.host, "port": p.port,
+                "addr": p.addr, "ping_ms": round(p.ping, 1),
+                "checks_passed": p.checks_passed,
+                "checks_total": p.checks_total,
+                "confirmed": p.confirmed,
+                "checked_at": datetime.utcnow().isoformat() + "Z",
+            } for p in alive],
+        }
+        try:
+            with open(os.path.join(SCRIPT_DIR, "confirmed.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(f"  {C.CYA}📦 JSON: confirmed.json{C.R}")
+        except Exception as e:
+            print(f"  {C.RED}Ошибка JSON: {e}{C.R}")
+
+        print(f"\n  {C.B}Топ-15 по ping (100% точность):{C.R}")
+        for p in alive[:15]:
+            print(f"    {C.GRN}✅{C.R} {p.ptype.upper():<7} "
+                  f"{p.addr:<22} {p.ping:6.0f} мс  "
+                  f"{C.GRAY}проходов: {p.checks_passed}/{p.checks_total}{C.R}")
+
+        print(f"\n  {C.GRN}💾 100% подтверждённые дописаны в:{C.R}")
+        print(f"  {C.CYA}   {os.path.join(SCRIPT_DIR, 'confirmed.txt')}{C.R}")
+    else:
+        print(f"\n  {C.RED}Ни один прокси не прошёл все проходы.{C.R}")
+
+    input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
 
 # ======================= УМНЫЙ РЕЖИМ =======================
@@ -459,43 +707,11 @@ def smart_mode(selected_type: str, target_alive: int):
         avg = sum(p.ping for p in final) / len(final)
         print(f"\n  {C.GRN}🏁 Итог: {len(final)} лучших живых · "
               f"Средний ping: {avg:.0f} мс{C.R}")
-        save_list(final, os.path.join(AUTO_SAVE_DIR, "_smart_alive.txt"))
-        save_list(final[:500], os.path.join(AUTO_SAVE_DIR, "_smart_top500.txt"))
-        save_json(final, os.path.join(AUTO_SAVE_DIR, "_smart_alive.json"))
+        write_summary(final, "smart_alive.txt")
+        write_summary(final[:500], "smart_top500.txt")
     else:
         print(f"\n  {C.RED}Живых прокси не найдено.{C.R}")
     return final
-
-
-# ======================= СОХРАНЕНИЕ СВОДНЫХ =======================
-def save_list(items: List[ProxyItem], path: str):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            for p in items:
-                f.write(f"{p.ptype}://{p.addr}\n")
-        print(f"  {C.CYA}💾 Сохранено {len(items)} → {path}{C.R}")
-    except Exception as e:
-        print(f"  {C.RED}Ошибка сохранения {path}: {e}{C.R}")
-
-
-def save_json(items: List[ProxyItem], path: str):
-    payload = {
-        "source": "Chekdido 2026 CLI",
-        "count": len(items),
-        "proxies": [{
-            "type": p.ptype, "host": p.host, "port": p.port,
-            "addr": p.addr, "ping_ms": round(p.ping, 1),
-            "anonymity": p.anonymity, "exit_ip": p.exit_ip,
-            "protocol": p.protocol,
-            "checked_at": datetime.utcnow().isoformat() + "Z",
-        } for p in items],
-    }
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"  {C.CYA}📦 JSON сохранён: {path}{C.R}")
-    except Exception as e:
-        print(f"  {C.RED}Ошибка JSON: {e}{C.R}")
 
 
 # ======================= МЕНЮ =======================
@@ -535,10 +751,11 @@ def main_menu():
         banner()
         print(f"  {C.B}{C.WHT}МЕНЮ{C.R}\n")
         print(f"    {C.MAG}1{C.R}) 🧠  Умный режим (скачать → чекать → цель живых)")
-        print(f"    {C.CYA}2{C.R}) ⬇  Скачать прокси 2026 (сохраняет каждый в .txt)")
-        print(f"    {C.GRN}3{C.R}) ⚡  Проверить скачанные прокси")
-        print(f"    {C.YEL}4{C.R}) 📁  Показать путь к папке автосейва")
-        print(f"    {C.GRAY}5{C.R}) 🧹  Очистить папку автосейва")
+        print(f"    {C.CYA}2{C.R}) ⬇  Скачать прокси 2026 (raw_*.txt)")
+        print(f"    {C.GRN}3{C.R}) ⚡  Проверить скачанные прокси → {C.WHT}socks5.txt / http.txt / socks4.txt{C.R}")
+        print(f"    {C.YEL}4{C.R}) 🎯  Быстрый чек живых с точностью")
+        print(f"    {C.BLU}5{C.R}) 📁  Показать путь и файлы")
+        print(f"    {C.GRAY}6{C.R}) 🧹  Очистить все .txt")
         print(f"    {C.RED}0{C.R}) 🚪  Выход\n")
 
         try:
@@ -560,41 +777,27 @@ def main_menu():
             input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
         elif choice == "3":
-            ensure_dir()
-            try:
-                files = [f for f in os.listdir(AUTO_SAVE_DIR)
-                         if f.endswith(".txt") and not f.startswith("_")
-                         and not f.startswith("raw_")]
-            except Exception:
-                files = []
-
-            if not files:
-                print(f"\n  {C.YEL}⚠ Папка автосейва пуста. Сначала скачайте прокси.{C.R}")
-                print(f"  {C.GRAY}Папка: {AUTO_SAVE_DIR}{C.R}")
+            proxy_files = collect_proxy_files()
+            if not proxy_files:
+                print(f"\n  {C.YEL}⚠ Нет .txt с прокси. Сначала скачайте прокси.{C.R}")
+                print(f"  {C.GRAY}Папка: {SCRIPT_DIR}{C.R}")
                 input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
                 continue
 
-            print(f"\n  {C.CYA}Найдено {len(files)} .txt файлов.{C.R}")
+            print(f"\n  {C.CYA}Найдено {len(proxy_files)} .txt файлов.{C.R}")
             limit = ask_int("Сколько проверить (0 = все)", 500)
-            if limit <= 0:
-                limit = len(files)
+            if limit < 0:
+                limit = 0
 
-            items: List[ProxyItem] = []
-            for fname in files[:limit]:
-                try:
-                    with open(os.path.join(AUTO_SAVE_DIR, fname),
-                              encoding="utf-8") as f:
-                        line = f.read().strip()
-                    it = parse_proxy_line(line)
-                    if it:
-                        items.append(it)
-                except Exception:
-                    pass
+            items = load_proxies_from_files(proxy_files, limit)
 
             if not items:
                 print(f"  {C.RED}Не удалось прочитать ни один прокси.{C.R}")
                 input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
                 continue
+
+            print(f"\n  {C.CYA}⚡ Проверка {len(items)} прокси...{C.R}")
+            print(f"  {C.GRAY}Живые будут дописаны в socks5.txt / http.txt / socks4.txt{C.R}\n")
 
             pb = ProgressBar(len(items), label="проверка", width=30)
             stop_event = threading.Event()
@@ -607,14 +810,28 @@ def main_menu():
             alive = [p for p in items if p.alive and p.checked]
             alive.sort(key=lambda x: x.ping)
             print(f"\n  {C.GRN}✅ Живых: {len(alive)} из {len(items)}{C.R}")
+
             if alive:
-                save_list(alive, os.path.join(AUTO_SAVE_DIR, "_alive_all.txt"))
-                save_list(alive[:500], os.path.join(AUTO_SAVE_DIR, "_alive_top500.txt"))
+                # Сводные файлы (перезаписываются)
+                write_summary(alive, "alive.txt")
+                write_summary(alive[:500], "alive_top500.txt")
                 for t in ("http", "socks4", "socks5"):
                     sub = [p for p in alive if p.ptype == t]
                     if sub:
-                        save_list(sub, os.path.join(AUTO_SAVE_DIR, f"_alive_{t}.txt"))
-                save_json(alive, os.path.join(AUTO_SAVE_DIR, "_alive.json"))
+                        write_summary(sub, f"alive_{t}.txt")
+
+                # Сколько живых теперь в общих socks5.txt / http.txt / socks4.txt
+                print(f"\n  {C.GRN}💾 Дописано в общие файлы:{C.R}")
+                for t in ("http", "socks4", "socks5"):
+                    p = os.path.join(SCRIPT_DIR, f"{t}.txt")
+                    cnt = 0
+                    if os.path.exists(p):
+                        try:
+                            with open(p, encoding="utf-8") as f:
+                                cnt = sum(1 for _ in f)
+                        except Exception:
+                            pass
+                    print(f"    {C.CYA}{t}.txt{C.R}  →  {cnt} строк")
 
                 print(f"\n  {C.B}Топ-10 по ping:{C.R}")
                 for p in alive[:10]:
@@ -625,42 +842,44 @@ def main_menu():
             input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
         elif choice == "4":
-            ensure_dir()
-            print(f"\n  {C.GRN}📁 Папка автосейва:{C.R}")
-            print(f"  {C.CYA}{AUTO_SAVE_DIR}{C.R}\n")
+            quick_precision_mode()
+
+        elif choice == "5":
+            print(f"\n  {C.GRN}📁 Папка со скриптом:{C.R}")
+            print(f"  {C.CYA}{SCRIPT_DIR}{C.R}\n")
             files = []
             try:
-                files = [f for f in os.listdir(AUTO_SAVE_DIR)
-                         if f.endswith(".txt")]
+                files = [f for f in os.listdir(SCRIPT_DIR) if f.endswith(".txt")]
             except Exception:
                 pass
             print(f"  {C.WHT}Файлов .txt: {len(files)}{C.R}")
-
-            # В Termux можно открыть через файловый менеджер вручную
-            if files:
-                print(f"\n  {C.B}Последние 10 файлов:{C.R}")
-                for f in sorted(files)[-10:]:
+            for f in sorted(files):
+                try:
+                    size = os.path.getsize(os.path.join(SCRIPT_DIR, f))
+                    if size < 1024:
+                        s = f"{size} B"
+                    elif size < 1024 * 1024:
+                        s = f"{size / 1024:.1f} KB"
+                    else:
+                        s = f"{size / 1024 / 1024:.1f} MB"
+                    print(f"    {C.GRAY}•{C.R} {f:<30} {C.CYA}{s}{C.R}")
+                except Exception:
                     print(f"    {C.GRAY}•{C.R} {f}")
-
             print(f"\n  {C.YEL}Как открыть в Android:{C.R}")
-            print(f"  {C.GRAY}Откройте проводник и перейдите в:{C.R}")
-            print(f"  {C.CYA}{AUTO_SAVE_DIR}{C.R}")
-            print(f"  {C.GRAY}(начните путь с /data/data/com.termux/...){C.R}")
-
+            print(f"  {C.GRAY}Проводник → начните путь с /data/data/com.termux/...{C.R}")
             input(f"\n  {C.GRAY}Нажмите Enter...{C.R}")
 
-        elif choice == "5":
-            ensure_dir()
+        elif choice == "6":
             confirm = input(
-                f"  {C.RED}Удалить все .txt и .json в {AUTO_SAVE_DIR}? (y/N):{C.R} "
+                f"  {C.RED}Удалить ВСЕ .txt и .json в {SCRIPT_DIR}? (y/N):{C.R} "
             ).strip().lower()
             if confirm == "y":
                 cnt = 0
                 try:
-                    for f in os.listdir(AUTO_SAVE_DIR):
+                    for f in os.listdir(SCRIPT_DIR):
                         if f.endswith(".txt") or f.endswith(".json"):
                             try:
-                                os.remove(os.path.join(AUTO_SAVE_DIR, f))
+                                os.remove(os.path.join(SCRIPT_DIR, f))
                                 cnt += 1
                             except Exception:
                                 pass
@@ -672,15 +891,13 @@ def main_menu():
         elif choice == "0":
             print(f"\n  {C.CYA}До встречи! 👋{C.R}\n")
             print(f"  {C.GRAY}Все файлы сохранены в:{C.R}")
-            print(f"  {C.CYA}{AUTO_SAVE_DIR}{C.R}\n")
+            print(f"  {C.CYA}{SCRIPT_DIR}{C.R}\n")
             return
 
 
 # ======================= СТАРТ =======================
 if __name__ == "__main__":
-    # Создаём папку автосейва сразу при запуске
-    ensure_dir()
-    print(f"{C.GRN}📁 Папка автосейва: {AUTO_SAVE_DIR}{C.R}")
+    print(f"{C.GRN}📁 Папка со скриптом: {SCRIPT_DIR}{C.R}")
     time.sleep(0.5)
 
     try:
